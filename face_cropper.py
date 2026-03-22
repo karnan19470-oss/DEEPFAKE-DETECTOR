@@ -20,12 +20,13 @@ if not os.path.exists(model_path):
         model_path
     )
 
-face_net = cv2.dnn.readNetFromCaffe(prototxt_path, model_path)
+face_net = cv2.dnn.readNetFromCaffe(
+    "deploy.prototxt",
+    "res10_300x300_ssd_iter_140000.caffemodel"
+)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 prototxt_path = os.path.join(BASE_DIR, "deploy.prototxt")
-model_path = os.path.join(BASE_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
 
-face_net = cv2.dnn.readNetFromCaffe(prototxt_path, model_path)
 
 OUTPUT_DIR = "cropped_faces"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -106,7 +107,7 @@ def crop_faces(image_path):
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     rgb = enhance_image(rgb)
 
-    detections = detector.detect_faces(rgb)
+    detections = detect_faces_dnn(rgb)
 
     if len(detections) == 0:
         print("⚠️ No faces detected")
