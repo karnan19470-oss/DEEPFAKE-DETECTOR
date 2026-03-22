@@ -1,10 +1,31 @@
 import cv2
-import os
 import numpy as np
-face_net = cv2.dnn.readNetFromCaffe(
-    "deploy.prototxt",
-    "res10_300x300_ssd_iter_140000.caffemodel"
-)
+import os
+import urllib.request
+
+# File paths
+prototxt_path = "deploy.prototxt"
+model_path = "res10_300x300_ssd_iter_140000.caffemodel"
+
+# Download if not exists
+if not os.path.exists(prototxt_path):
+    urllib.request.urlretrieve(
+        "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt",
+        prototxt_path
+    )
+
+if not os.path.exists(model_path):
+    urllib.request.urlretrieve(
+        "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel",
+        model_path
+    )
+
+face_net = cv2.dnn.readNetFromCaffe(prototxt_path, model_path)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+prototxt_path = os.path.join(BASE_DIR, "deploy.prototxt")
+model_path = os.path.join(BASE_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
+
+face_net = cv2.dnn.readNetFromCaffe(prototxt_path, model_path)
 
 OUTPUT_DIR = "cropped_faces"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
