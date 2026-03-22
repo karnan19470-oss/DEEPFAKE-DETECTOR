@@ -1,5 +1,4 @@
 import os
-import gdown
 import torch
 import torch.nn as nn
 from torchvision import transforms
@@ -7,23 +6,18 @@ from torchvision.models import resnet18
 from face_cropper import crop_faces
 import cv2
 import numpy as np
+import gdown
 import streamlit as st
-
-# ==========================
-# MODEL DOWNLOAD (FIXED)
-# ==========================
-
-MODEL_URL = "https://drive.google.com/uc?id=1-a2E3_hsSKm_BsxvZlT_dJ8oP3Z8J6FK"
-MODEL_PATH = "model.pth"
-
-if not os.path.exists(MODEL_PATH):
-    print("Downloading model...")
-    gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
 
 # ==========================
 # SETTINGS
 # ==========================
 
+MODEL_PATH = "deepfake_resnet18_best.pth"
+
+if not os.path.exists(MODEL_PATH):
+    url = "https://drive.google.com/uc?id=1-a2E3_hsSKm_BsxvZlT_dJ8oP3Z8J6FK"
+    gdown.download(url, MODEL_PATH, quiet=False)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CLASS_NAMES = ["Human Real Face", "Human Fake Face"]
@@ -46,17 +40,44 @@ model.fc = nn.Sequential(
     nn.Dropout(0.5),
     nn.Linear(256, 2)
 )
-
-# FREEZE BACKBONE
+# ✅ FREEZE BACKBONE
 for param in model.parameters():
     param.requires_grad = False
 
-# UNFREEZE FC
+# ✅ UNFREEZE FC LAYER (VERY IMPORTANT)
 for param in model.fc.parameters():
     param.requires_grad = True
 
+model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+model = model.to(DEVICE)
+model.eval()
+
 print("Model loaded successfully")
 print("Using device:", DEVICE)
+
+# ==========================
+# IMAGE ENHANCEMENT
+# ==========================
+
+def enhance_image(image):
+    image = cv2.fastNlMeansDenoisingColored(image, None, 5, 5, 7, 21)
+
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+
+    limg = cv2.merge((cl, a, b))
+    enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
+
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5,-1],
+                       [0, -1, 0]])
+
+    sharpened = cv2.filter2D(enhanced, -1, kernel)
+
+    return sharpened
 
 # ==========================
 # TRANSFORM
@@ -84,6 +105,7 @@ def predict_with_tta(face_img):
 
         img = face_img.copy()
 
+        # ✅ ONLY safe augmentation
         if i == 1:
             img = cv2.flip(img, 1)
 
@@ -139,13 +161,14 @@ def predict_image(image_path):
         fake_probability = prob[1].item()
         real_probability = prob[0].item()
 
-        # STEP 3 (skip weak predictions)
+        # ✅ STEP 3 (skip weak predictions)
         if abs(fake_probability - real_probability) < 0.15:
             continue
 
         if fake_probability < 0.3 and real_probability < 0.3:
             continue
 
+        # ✅ LABEL FIX
         if fake_probability > real_probability:
             label = CLASS_NAMES[1]
             confidence = fake_probability * 100
@@ -153,9 +176,11 @@ def predict_image(image_path):
             label = CLASS_NAMES[0]
             confidence = real_probability * 100
 
+        # ✅ CORRECT POSITION
         fake_probs.append(fake_probability)
         face_results.append((label, confidence))
 
+    # ✅ HANDLE EMPTY CASE
     if len(fake_probs) == 0:
         return {
             "label": "Uncertain",
@@ -165,6 +190,8 @@ def predict_image(image_path):
             "face_results": []
         }
 
+    # ✅ FINAL DECISION (ONLY ONCE)
+    avg_fake_prob = max(fake_probs)
 
     if avg_fake_prob > FAKE_THRESHOLD:
         final_result = CLASS_NAMES[1]
