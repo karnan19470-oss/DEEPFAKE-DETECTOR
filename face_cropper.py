@@ -1,13 +1,10 @@
 import cv2
 import os
 import numpy as np
-from mtcnn import MTCNN
-
-# ==========================
-# INIT
-# ==========================
-
-detector = MTCNN()
+face_net = cv2.dnn.readNetFromCaffe(
+    "deploy.prototxt",
+    "res10_300x300_ssd_iter_140000.caffemodel"
+)
 
 OUTPUT_DIR = "cropped_faces"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -42,31 +39,30 @@ def is_blurry(image, threshold=50):
 # ==========================
 # MULTI-SCALE DETECTION
 # ==========================
+def detect_faces_dnn(image):
+    h, w = image.shape[:2]
 
-def detect_faces_multi_scale(image):
-    detections = []
-    scales = [1.0, 0.75, 1.25]
+    blob = cv2.dnn.blobFromImage(image, 1.0, (300, 300),
+                                 (104.0, 177.0, 123.0))
 
-    for scale in scales:
-        resized = cv2.resize(image, None, fx=scale, fy=scale)
-        results = detector.detect_faces(resized)
+    face_net.setInput(blob)
+    detections = face_net.forward()
 
-        for det in results:
-            x, y, w, h = det['box']
-            conf = det['confidence']
+    results = []
 
-            x = int(x / scale)
-            y = int(y / scale)
-            w = int(w / scale)
-            h = int(h / scale)
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
 
-            detections.append({
-                "box": [x, y, w, h],
-                "confidence": conf
+        if confidence > 0.6:
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            x1, y1, x2, y2 = box.astype("int")
+
+            results.append({
+                "box": [x1, y1, x2 - x1, y2 - y1],
+                "confidence": confidence
             })
 
-    return detections
-
+    return results
 # ==========================
 # SAFE BOX CLAMP
 # ==========================
