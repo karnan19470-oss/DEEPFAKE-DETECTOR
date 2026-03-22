@@ -7,6 +7,7 @@ from torchvision.models import resnet18
 from face_cropper import crop_faces
 import cv2
 import numpy as np
+import streamlit as st
 
 # ==========================
 # MODEL DOWNLOAD (FIXED)
@@ -53,10 +54,6 @@ for param in model.parameters():
 # UNFREEZE FC
 for param in model.fc.parameters():
     param.requires_grad = True
-
-model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-model = model.to(DEVICE)
-model.eval()
 
 print("Model loaded successfully")
 print("Using device:", DEVICE)
@@ -168,7 +165,6 @@ def predict_image(image_path):
             "face_results": []
         }
 
-    avg_fake_prob = max(fake_probs)
 
     if avg_fake_prob > FAKE_THRESHOLD:
         final_result = CLASS_NAMES[1]
