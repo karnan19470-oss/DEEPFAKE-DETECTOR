@@ -1,3 +1,5 @@
+import os
+import gdown
 import sys
 import torch
 import torch.nn as nn
@@ -7,13 +9,20 @@ import cv2
 import numpy as np
 
 # ==========================
-# SETTINGS (OPTIMIZED)
+# MODEL DOWNLOAD
 # ==========================
 
-MODEL_PATH = "https://drive.google.com/uc?id=1-a2E3_hsSKm_BsxvZlT_dJ8oP3Z8J6FK"
+MODEL_URL = "https://drive.google.com/uc?id=1-a2E3_hsSKm_BsxvZlT_dJ8oP3Z8J6FK"
+MODEL_PATH = "model.pth"
+
 if not os.path.exists(MODEL_PATH):
-    url = "https://drive.google.com/uc?id=1-a2E3_hsSKm_BsxvZlT_dJ8oP3Z8J6FK"
-    gdown.download(url, MODEL_PATH, quiet=False)
+    print("Downloading model...")
+    gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
+
+# ==========================
+# SETTINGS
+# ==========================
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CLASS_NAMES = ["Real Video", "Fake Video"]
@@ -56,7 +65,7 @@ base_transform = transforms.Compose([
 ])
 
 # ==========================
-# FAST FACE DETECTOR (OpenCV DNN)
+# FACE DETECTOR
 # ==========================
 
 face_net = cv2.dnn.readNetFromCaffe(
@@ -65,20 +74,15 @@ face_net = cv2.dnn.readNetFromCaffe(
 )
 
 # ==========================
-# LIGHT FACE ENHANCEMENT
-# ==========================
-
-def enhance_face(face):
-    return cv2.GaussianBlur(face, (3, 3), 0)
-
-# ==========================
-# TTA PREDICTION (LIGHT)
+# TTA
 # ==========================
 
 def predict_face(face_img):
+
     probs = []
 
     for i in range(TTA_RUNS):
+
         img_variant = face_img.copy()
 
         if i == 1:
@@ -96,22 +100,27 @@ def predict_face(face_img):
     return mean_prob[0][0].item(), mean_prob[0][1].item()
 
 # ==========================
-# FACE DETECTION FUNCTION
+# FACE DETECTION
 # ==========================
 
 def detect_faces_dnn(frame):
+
     h, w = frame.shape[:2]
+
     blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300),
                                  (104.0, 177.0, 123.0))
+
     face_net.setInput(blob)
     detections = face_net.forward()
 
     faces = []
 
     for i in range(detections.shape[2]):
+
         confidence = detections[0, 0, i, 2]
 
         if confidence > 0.6:
+
             box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
             x1, y1, x2, y2 = box.astype("int")
 
@@ -130,7 +139,7 @@ def detect_faces_dnn(frame):
 # ==========================
 
 if len(sys.argv) < 2:
-    print("Usage: python predict_video_fast.py <video_path>")
+    print("Usage: python predict_video.py <video_path>")
     sys.exit()
 
 video_path = sys.argv[1]
@@ -176,8 +185,6 @@ while True:
         if face.size == 0:
             continue
 
-        face = enhance_face(face)
-
         real_p, fake_p = predict_face(face)
 
         if max(real_p, fake_p) < MIN_FRAME_CONF:
@@ -188,7 +195,7 @@ while True:
 cap.release()
 
 # ==========================
-# FINAL DECISION (STABLE)
+# FINAL RESULT
 # ==========================
 
 if len(fake_scores) == 0:
@@ -197,16 +204,12 @@ if len(fake_scores) == 0:
 
 fake_scores = np.array(fake_scores)
 
-# Temporal smoothing
 window = min(5, len(fake_scores))
 smoothed = np.convolve(fake_scores,
                        np.ones(window) / window,
                        mode='valid')
 
-# Stable decision using median
 representative_score = np.median(smoothed)
-
-# Ratio-based decision
 fake_ratio = np.mean(fake_scores > 0.5)
 
 is_fake = fake_ratio > 0.4
