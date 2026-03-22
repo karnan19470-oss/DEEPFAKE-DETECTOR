@@ -16,8 +16,11 @@ import streamlit as st
 MODEL_PATH = "deepfake_resnet18_best.pth"
 
 if not os.path.exists(MODEL_PATH):
-    url = "https://drive.google.com/uc?id=1-a2E3_hsSKm_BsxvZlT_dJ8oP3Z8J6FK"
-    gdown.download(url, MODEL_PATH, quiet=False)
+    import urllib.request
+    url = "https://huggingface.co/Navxx/DEEPFAKE-DETECTION1/resolve/main/deepfake_resnet18_best.pth"
+    urllib.request.urlretrieve(url, MODEL_PATH)
+import urllib.request
+urllib.request.urlretrieve(url, MODEL_PATH)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CLASS_NAMES = ["Human Real Face", "Human Fake Face"]
