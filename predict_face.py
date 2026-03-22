@@ -11,6 +11,9 @@ import numpy as np
 # ==========================
 
 MODEL_PATH = "https://drive.google.com/uc?id=1-a2E3_hsSKm_BsxvZlT_dJ8oP3Z8J6FK"
+if not os.path.exists(MODEL_PATH):
+    url = "https://drive.google.com/uc?id=1-a2E3_hsSKm_BsxvZlT_dJ8oP3Z8J6FK"
+    gdown.download(url, MODEL_PATH, quiet=False)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CLASS_NAMES = ["Human Real Face", "Human Fake Face"]
