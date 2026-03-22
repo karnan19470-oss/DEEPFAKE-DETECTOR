@@ -1,16 +1,16 @@
 import os
-import sys
 import torch
 import torch.nn as nn
 from torchvision import transforms
 from torchvision.models import resnet18
+from face_cropper import crop_faces
 import cv2
 import numpy as np
 import gdown
 import streamlit as st
 
 # ==========================
-# SETTINGS (OPTIMIZED)
+# SETTINGS
 # ==========================
 
 MODEL_PATH = "deepfake_resnet18_best.pth"

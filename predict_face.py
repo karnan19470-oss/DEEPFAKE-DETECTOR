@@ -8,7 +8,6 @@ import cv2
 import numpy as np
 import gdown
 import streamlit as st
-import urllib.request
 
 # ==========================
 # SETTINGS
@@ -156,35 +155,41 @@ def predict_image(image_path):
 
         face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
         face = np.ascontiguousarray(face)
-
         if face.shape[0] < 50 or face.shape[1] < 50:
             continue
+
 
         prob = predict_with_tta(face)
 
         fake_probability = prob[1].item()
         real_probability = prob[0].item()
 
-        # ✅ STEP 3 (skip weak predictions)
+        # 🚨 STEP 3 FIX (ADD HERE)
         if abs(fake_probability - real_probability) < 0.15:
-            continue
-
+         continue
         if fake_probability < 0.3 and real_probability < 0.3:
             continue
-
-        # ✅ LABEL FIX
         if fake_probability > real_probability:
             label = CLASS_NAMES[1]
             confidence = fake_probability * 100
         else:
             label = CLASS_NAMES[0]
             confidence = real_probability * 100
-
-        # ✅ CORRECT POSITION
         fake_probs.append(fake_probability)
-        face_results.append((label, confidence))
+        avg_fake_prob = max(fake_probs)
 
-    # ✅ HANDLE EMPTY CASE
+    if avg_fake_prob > FAKE_THRESHOLD:
+            final_result = CLASS_NAMES[1]
+            final_confidence = avg_fake_prob * 100
+    else:
+            final_result = CLASS_NAMES[0]
+            final_confidence = (1 - avg_fake_prob) * 100
+    final_confidence = min(max(final_confidence, 50), 100)
+
+    fake_probs.append(fake_probability)
+    face_results.append((label, confidence))
+    print("Fake probabilities for faces:", fake_probs)
+
     if len(fake_probs) == 0:
         return {
             "label": "Uncertain",
@@ -194,7 +199,6 @@ def predict_image(image_path):
             "face_results": []
         }
 
-    # ✅ FINAL DECISION (ONLY ONCE)
     avg_fake_prob = max(fake_probs)
 
     if avg_fake_prob > FAKE_THRESHOLD:
@@ -203,11 +207,12 @@ def predict_image(image_path):
     else:
         final_result = CLASS_NAMES[0]
         final_confidence = (1 - avg_fake_prob) * 100
-
     final_confidence = max(final_confidence, 50)
-
+    if final_confidence < 1:
+     final_confidence = 50
     print("Fake probs:", fake_probs)
-    print("Final:", avg_fake_prob)
+    print("Final avg:", avg_fake_prob)
+    final_confidence = max(final_confidence, 50)
 
     return {
         "label": final_result,
