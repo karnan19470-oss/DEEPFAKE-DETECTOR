@@ -1,7 +1,7 @@
+streamlit
 torch
 torchvision
-opencv-python
 numpy
+opencv-python-headless
 mtcnn
-streamlit
-Pillow
+gdown
