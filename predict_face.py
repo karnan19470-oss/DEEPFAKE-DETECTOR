@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import gdown
 import streamlit as st
+import urllib.request
 
 # ==========================
 # SETTINGS
