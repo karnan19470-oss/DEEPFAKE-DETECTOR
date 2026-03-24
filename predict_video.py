@@ -4,226 +4,222 @@ import torch.nn as nn
 from torchvision import transforms
 from torchvision.models import resnet18
 from face_cropper import crop_faces
+from utils import enhance_image   # FIX 8: shared utility, not duplicated
 import cv2
 import numpy as np
-import gdown
-import streamlit as st
+import urllib.request
 
 # ==========================
-# SETTINGS
+# MODEL DOWNLOAD
 # ==========================
 
-MODEL_PATH = "deepfake_resnet18_best.pth"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "deepfake_resnet18_best.pth")
+URL = "https://huggingface.co/Navxx/DEEPFAKE-DETECTION1/resolve/main/deepfake_resnet18_best.pth"
 
 if not os.path.exists(MODEL_PATH):
-    import urllib.request
-    url = "https://huggingface.co/Navxx/DEEPFAKE-DETECTION1/resolve/main/deepfake_resnet18_best.pth"
-    urllib.request.urlretrieve(url, MODEL_PATH)
-import urllib.request
-urllib.request.urlretrieve(url, MODEL_PATH)
+    print("Downloading deepfake model...")
+    urllib.request.urlretrieve(URL, MODEL_PATH)
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CLASS_NAMES = ["Human Real Face", "Human Fake Face"]
 
-CLASS_NAMES = ["Real Video", "Fake Video"]
-
-IMG_SIZE = 256
+IMG_SIZE = 224
 TTA_RUNS = 2
-FRAME_SKIP = 5
-FAKE_THRESHOLD = 0.55
-MIN_FRAME_CONF = 0.7
-MIN_FACE_SIZE = 80
 
 # ==========================
-# LOAD MODEL
+# MODEL ARCHITECTURE
 # ==========================
 
 model = resnet18(weights=None)
-
 model.fc = nn.Sequential(
     nn.Linear(model.fc.in_features, 256),
     nn.ReLU(),
     nn.Dropout(0.5),
     nn.Linear(256, 2)
 )
-
 model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-model = model.to(DEVICE).eval()
+model = model.to(DEVICE)
+model.eval()
 
-print("Model Loaded on:", DEVICE)
+print("Model loaded successfully")
+print("Using device:", DEVICE)
 
 # ==========================
 # TRANSFORM
 # ==========================
 
-base_transform = transforms.Compose([
+transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225])
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
 ])
 
 # ==========================
-# FAST FACE DETECTOR (OpenCV DNN)
+# TTA
 # ==========================
 
-face_net = cv2.dnn.readNetFromCaffe(
-    "deploy.prototxt",
-    "res10_300x300_ssd_iter_140000.caffemodel"
-)
-
-# ==========================
-# LIGHT FACE ENHANCEMENT
-# ==========================
-
-def enhance_face(face):
-    return cv2.GaussianBlur(face, (3, 3), 0)
-
-# ==========================
-# TTA PREDICTION (LIGHT)
-# ==========================
-
-def predict_face(face_img):
+def predict_with_tta(face_img: np.ndarray) -> torch.Tensor:
+    """
+    Run TTA over the face image (RGB uint8, any size).
+    Returns a 1D tensor of shape [2] with softmax probabilities.
+    """
     probs = []
-
     for i in range(TTA_RUNS):
-        img_variant = face_img.copy()
-
+        img = face_img.copy()
         if i == 1:
-            img_variant = cv2.flip(img_variant, 1)
-
-        tensor = base_transform(img_variant).unsqueeze(0).to(DEVICE)
-
+            img = cv2.flip(img, 1)
+        tensor = transform(img).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             output = model(tensor)
             prob = torch.softmax(output, dim=1)
             probs.append(prob)
-
-    mean_prob = torch.mean(torch.stack(probs), dim=0)
-
-    return mean_prob[0][0].item(), mean_prob[0][1].item()
+    return torch.mean(torch.stack(probs), dim=0).squeeze()
 
 # ==========================
-# FACE DETECTION FUNCTION
+# BLUR CHECK
 # ==========================
 
-def detect_faces_dnn(frame):
-    h, w = frame.shape[:2]
-    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300),
-                                 (104.0, 177.0, 123.0))
-    face_net.setInput(blob)
-    detections = face_net.forward()
-
-    faces = []
-
-    for i in range(detections.shape[2]):
-        confidence = detections[0, 0, i, 2]
-
-        if confidence > 0.6:
-            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-            x1, y1, x2, y2 = box.astype("int")
-
-            w_box = x2 - x1
-            h_box = y2 - y1
-
-            if w_box < MIN_FACE_SIZE or h_box < MIN_FACE_SIZE:
-                continue
-
-            faces.append((x1, y1, x2, y2))
-
-    return faces
+def laplacian_variance(rgb_image: np.ndarray) -> float:
+    """Compute Laplacian variance on grayscale for a reliable blur score."""
+    gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 # ==========================
-# MAIN
+# MAIN FUNCTION
 # ==========================
 
-if len(sys.argv) < 2:
-    print("Usage: python predict_video_fast.py <video_path>")
-    sys.exit()
+def predict_image(image_path: str) -> dict:
+    """
+    Predict whether the face(s) in image_path are real or fake.
 
-video_path = sys.argv[1]
+    Returns a dict with keys:
+        label         — overall prediction string
+        confidence    — 0-100 float
+        faces         — list of cropped face paths
+        boxes         — list of (x, y, w, h) tuples
+        face_results  — list of (label, confidence) per face
+    """
+    cropped_paths, face_boxes = crop_faces(image_path)
 
-cap = cv2.VideoCapture(video_path)
+    # ==========================
+    # NO FACE DETECTED
+    # ==========================
+    if len(cropped_paths) == 0:
+        image = cv2.imread(image_path)
+        if image is None:
+            return {
+                "label": "Invalid Image",
+                "confidence": 0.0,
+                "faces": [],
+                "boxes": [],
+                "face_results": []
+            }
 
-if not cap.isOpened():
-    print("Error opening video.")
-    sys.exit()
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = cv2.resize(image, (IMG_SIZE, IMG_SIZE))
 
-frame_id = 0
-fake_scores = []
+        if np.std(image) < 60:
+            image = enhance_image(image)
 
-print("\nAnalyzing:", video_path)
+        prob = predict_with_tta(image)
+        fake_p = prob[1].item()
+        real_p = prob[0].item()
 
-while True:
+        if fake_p >= real_p:
+            label, confidence = "Human Fake Face", fake_p * 100
+        else:
+            label, confidence = "Human Real Face", real_p * 100
 
-    ret, frame = cap.read()
+        return {
+            "label": label,
+            "confidence": round(confidence, 2),
+            "faces": [],
+            "boxes": [],
+            "face_results": []
+        }
 
-    if not ret:
-        break
+    # ==========================
+    # FACE DETECTED
+    # ==========================
+    fake_probs = []
+    face_results = []
 
-    frame_id += 1
-
-    if frame_id % FRAME_SKIP != 0:
-        continue
-
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    faces = detect_faces_dnn(frame)
-
-    for (x1, y1, x2, y2) in faces:
-
-        margin = int(0.2 * (x2 - x1))
-
-        x1 = max(0, x1 - margin)
-        y1 = max(0, y1 - margin)
-        x2 = min(rgb.shape[1], x2 + margin)
-        y2 = min(rgb.shape[0], y2 + margin)
-
-        face = rgb[y1:y2, x1:x2]
-
-        if face.size == 0:
+    for path in cropped_paths:
+        face = cv2.imread(path) if isinstance(path, str) else path
+        if face is None:
             continue
 
-        face = enhance_face(face)
+        face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+        face = np.ascontiguousarray(face)
 
-        real_p, fake_p = predict_face(face)
-
-        if max(real_p, fake_p) < MIN_FRAME_CONF:
+        # FIX 4: Check size BEFORE resizing — after resize it is always 224x224
+        # so the check was dead code and tiny/noisy detections were never skipped.
+        if face.shape[0] < 50 or face.shape[1] < 50:
             continue
 
-        fake_scores.append(fake_p)
+        face = cv2.resize(face, (IMG_SIZE, IMG_SIZE))
 
-cap.release()
+        if laplacian_variance(face) < 30:
+            continue
 
-# ==========================
-# FINAL DECISION (STABLE)
-# ==========================
+        if np.std(face) < 60:
+            face = enhance_image(face)
 
-if len(fake_scores) == 0:
-    print("\nNo confident faces detected.")
-    sys.exit()
+        prob = predict_with_tta(face)
+        fake_p = prob[1].item()
+        real_p = prob[0].item()
 
-fake_scores = np.array(fake_scores)
+        if max(fake_p, real_p) < 0.50:
+            continue
 
-# Temporal smoothing
-window = min(5, len(fake_scores))
-smoothed = np.convolve(fake_scores,
-                       np.ones(window) / window,
-                       mode='valid')
+        fake_probs.append(fake_p)
 
-# Stable decision using median
-representative_score = np.median(smoothed)
+        if fake_p >= real_p:
+            label, conf = CLASS_NAMES[1], fake_p * 100
+        else:
+            label, conf = CLASS_NAMES[0], real_p * 100
 
-# Ratio-based decision
-fake_ratio = np.mean(fake_scores > 0.5)
+        face_results.append((label, round(conf, 2)))
 
-is_fake = fake_ratio > 0.4
-confidence = fake_ratio if is_fake else (1 - fake_ratio)
+    # ==========================
+    # AFTER LOOP
+    # ==========================
+    if not fake_probs:
+        return {
+            "label": "Low Quality / Uncertain",
+            "confidence": 0.0,
+            "faces": cropped_paths,
+            "boxes": face_boxes,
+            "face_results": []
+        }
 
-print("\n" + "=" * 40)
-print("FINAL VIDEO RESULT")
-print("=" * 40)
+    mean_fake_prob = float(np.mean(fake_probs))
 
-print("Prediction :", CLASS_NAMES[1] if is_fake else CLASS_NAMES[0])
-print(f"Confidence : {confidence * 100:.2f}%")
-print("Frames Analyzed :", len(fake_scores))
-print("=" * 40)
+    print(f"Per-face fake probs: {[round(p, 3) for p in fake_probs]}")
+    print(f"Mean fake prob: {mean_fake_prob:.3f}")
+
+    FAKE_THRESHOLD = 0.55
+    REAL_THRESHOLD = 0.45
+
+    if mean_fake_prob >= FAKE_THRESHOLD:
+        final_label = "Human Fake Face"
+        final_confidence = mean_fake_prob * 100
+    elif mean_fake_prob <= REAL_THRESHOLD:
+        final_label = "Human Real Face"
+        final_confidence = (1.0 - mean_fake_prob) * 100
+    else:
+        final_label = "Uncertain"
+        final_confidence = abs(mean_fake_prob - 0.5) * 200
+
+    return {
+        "label": final_label,
+        "confidence": round(min(final_confidence, 100.0), 2),
+        "faces": cropped_paths,
+        "boxes": face_boxes,
+        "face_results": face_results
+    }
