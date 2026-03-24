@@ -13,35 +13,57 @@ from predict_face import predict_image
 st.set_page_config(page_title="Deepfake Detector", layout="wide")
 
 # ==========================
-# CUSTOM CSS
+# CUSTOM CSS (FIXED VISIBILITY)
 # ==========================
 
 st.markdown("""
 <style>
+
+/* App background */
 .stApp {
     background-color: #f8fafc;
+    color: #0f172a;
 }
 
+/* File uploader container */
 [data-testid="stFileUploader"] {
     background-color: #1e293b;
     padding: 20px;
     border-radius: 15px;
 }
 
+/* File uploader text */
 [data-testid="stFileUploader"] label {
-    color: white;
+    color: white !important;
     font-size: 16px;
+    font-weight: 500;
 }
 
+/* Upload button */
 [data-testid="stFileUploader"] button {
-    background-color: #6366f1;
-    color: white;
+    background-color: #6366f1 !important;
+    color: white !important;
     border-radius: 10px;
+    border: none;
 }
 
+/* Fix invisible text inside uploader */
+[data-testid="stFileUploader"] div,
+[data-testid="stFileUploader"] span,
+[data-testid="stFileUploader"] p {
+    color: white !important;
+}
+
+/* Titles */
+h1, h2, h3 {
+    color: #0f172a !important;
+}
+
+/* Remove small help text */
 [data-testid="stFileUploader"] small {
     display: none;
 }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -78,7 +100,6 @@ tfile.close()
 # ==========================
 
 def cleanup_crops():
-    """Remove all temporary face crop files after prediction."""
     crops_dir = "cropped_faces"
     if os.path.exists(crops_dir):
         shutil.rmtree(crops_dir)
@@ -101,7 +122,6 @@ try:
         col1, col2 = st.columns(2)
 
         with col1:
-            # FIX 2: use_container_width replaces invalid width='stretch'
             st.image(file_bytes, use_container_width=True)
 
         with st.spinner("Analyzing image..."):
@@ -127,20 +147,17 @@ try:
                 face_img = cv2.imread(face_path) if isinstance(face_path, str) else face_path
                 if face_img is not None:
                     face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-                    # FIX 2: use_container_width replaces invalid width='stretch'
                     st.image(face_img, use_container_width=True)
 
         with col2:
             st.markdown("## Verdict")
 
-            # FIX 3: Handle all label types — Uncertain and error labels no longer
-            # silently fall through to the green "Real" success box.
             if "Fake" in label:
                 st.error(f"🚨 Fake ({confidence:.2f}%)")
             elif label in ("Uncertain", "Low Quality / Uncertain"):
                 st.warning(f"⚠️ Uncertain ({confidence:.2f}%)")
             elif label == "Invalid Image":
-                st.warning(f"⚠️ Invalid Image — could not process")
+                st.warning("⚠️ Invalid Image — could not process")
             else:
                 st.success(f"✅ Real ({confidence:.2f}%)")
 
@@ -159,8 +176,7 @@ try:
                 else:
                     label_text, conf = "Unknown", 0
 
-                label_parts = label_text.split()
-                name = label_parts[1] if len(label_parts) > 1 else label_text
+                name = label_text.split()[1] if len(label_text.split()) > 1 else label_text
 
                 color = (0, 0, 255) if "Fake" in label_text else (0, 255, 0)
                 text = f"{name} {conf:.1f}%"
@@ -184,10 +200,10 @@ try:
                 if face_img is None:
                     continue
                 face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+
                 with cols[i % 5]:
                     st.image(face_img, caption=f"Face {i + 1}")
 
-        # FIX 7: Clean up crop files after displaying them
         cleanup_crops()
 
     # ==========================
@@ -207,13 +223,13 @@ try:
             ret, frame = cap.read()
             if not ret:
                 break
+
             frame_count += 1
             if frame_count > 200:
                 break
 
             if frame_count % 10 == 0:
-                # FIX 9 (video): Use tempfile instead of bare relative path
-                # to avoid permission issues and working-directory surprises.
+
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as ftmp:
                     frame_path = ftmp.name
 
@@ -230,7 +246,6 @@ try:
                     print("Frame error:", e)
 
                 finally:
-                    # Always clean up the temp frame file
                     if os.path.exists(frame_path):
                         os.remove(frame_path)
                     cleanup_crops()
@@ -256,9 +271,6 @@ try:
         else:
             st.warning("No faces detected in video")
 
-# ==========================
-# FIX 6: Always delete the uploaded temp file, even if an exception was raised
-# ==========================
 finally:
     try:
         os.unlink(tfile.name)
