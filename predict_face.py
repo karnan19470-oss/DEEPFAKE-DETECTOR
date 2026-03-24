@@ -130,10 +130,10 @@ def predict_image(image_path: str) -> dict:
         fake_p = prob[1].item()
         real_p = prob[0].item()
 
-        if fake_p >= real_p:
+        if fake_p >= 0.50:
             label, confidence = "Human Fake Face", fake_p * 100
         else:
-            label, confidence = "Human Real Face", real_p * 100
+            label, confidence = "Human Real Face", (1 - fake_p) * 100
 
         return {
             "label": label,
