@@ -11,12 +11,22 @@ import streamlit as st
 import cv2
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from datetime import datetime
 import json
 
+# Handle matplotlib import with fallback
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    st.warning("Matplotlib not available. Charts will be disabled.")
+
 # Set matplotlib backend for Streamlit
-plt.switch_backend('Agg')
+if MATPLOTLIB_AVAILABLE:
+    plt.switch_backend('Agg')
 
 # Define cleanup function at the very beginning
 def cleanup_crops():
@@ -155,7 +165,6 @@ with st.sidebar:
     try:
         from predict_face import model
         if model is not None:
-            # Check if model is properly loaded
             st.success("✅ Model loaded successfully")
             st.session_state.model_status = "Loaded"
         else:
@@ -304,17 +313,12 @@ try:
             
             # Quick quality metrics
             try:
-                gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
                 blur_score = laplacian_variance(cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB))
                 contrast = np.std(img_array)
                 
                 with st.expander("📈 Quick Quality Check"):
                     st.write(f"**Blur Score:** {blur_score:.1f} {'(Blurry)' if blur_score < 25 else '(Sharp)'}")
                     st.write(f"**Contrast:** {contrast:.1f} {'(Low)' if contrast < 30 else '(Good)'}")
-                    
-                    quality_bar = st.progress(0)
-                    quality_score = min(100, (blur_score/50)*50 + (contrast/100)*50)
-                    quality_bar.progress(quality_score/100)
             except Exception as e:
                 st.warning(f"Quality check failed: {e}")
         
@@ -364,34 +368,12 @@ try:
                 st.write(f"**Raw Fake Probability:** {fake_prob:.3f}")
                 st.write(f"**Threshold:** {custom_threshold}")
                 
-                # Create gauge chart
-                fig, ax = plt.subplots(figsize=(8, 2))
-                colors = ['#10b981' if fake_prob < 0.5 else '#ef4444']
-                ax.barh(['Fake Probability'], [fake_prob * 100], color=colors, height=0.3)
-                ax.axvline(x=custom_threshold * 100, color='orange', linestyle='--', linewidth=2, label=f'Threshold')
-                ax.set_xlim(0, 100)
-                ax.set_xlabel('Probability (%)')
-                ax.set_title('Fake Detection Confidence')
-                ax.text(fake_prob * 100, 0, f'{fake_prob*100:.1f}%', ha='center', va='center', fontweight='bold')
-                plt.tight_layout()
-                st.pyplot(fig)
-                plt.close()
-            
-            # Display per-face results
-            face_results = result.get("face_results", [])
-            if face_results:
-                st.markdown("#### 👤 Per-Face Analysis")
-                
-                face_data = []
-                for i, (fr_label, fr_conf, _) in enumerate(face_results):
-                    face_data.append({
-                        "Face": f"Face {i+1}",
-                        "Result": "🚨 Fake" if "Fake" in fr_label else "✅ Real",
-                        "Confidence": f"{fr_conf:.1f}%"
-                    })
-                
-                df = pd.DataFrame(face_data)
-                st.dataframe(df, use_container_width=True)
+                # Create simple gauge using st.progress
+                col1, col2, col3 = st.columns([1, 2, 1])
+                with col2:
+                    st.write("Fake Probability")
+                    st.progress(fake_prob)
+                    st.caption(f"{fake_prob*100:.1f}%")
         
         # Debug mode
         if st.session_state.debug_mode:
@@ -399,21 +381,15 @@ try:
             st.markdown("### 🐛 Debug Information")
             
             with st.expander("Show Debug Info"):
-                # Show full result
-                st.write("**Full Result:**")
-                st.json(result)
-                
-                # Show model info
-                try:
-                    from predict_face import model, DEVICE
-                    st.write(f"**Device:** {DEVICE}")
-                    st.write(f"**Model Type:** {type(model).__name__}")
-                    
-                    # Count parameters
-                    total_params = sum(p.numel() for p in model.parameters())
-                    st.write(f"**Total Parameters:** {total_params:,}")
-                except:
-                    pass
+                # Show key information
+                st.write("**Prediction Details:**")
+                st.json({
+                    "label": result.get("label"),
+                    "confidence": result.get("confidence"),
+                    "faces_detected": len(result.get("faces", [])),
+                    "face_results": result.get("face_results", []),
+                    "error": result.get("error", False)
+                })
     
     else:
         # ==========================
@@ -504,43 +480,22 @@ try:
             st.metric("Frames Analyzed", frames_used)
             st.metric("Mean Fake Probability", f"{fake_prob:.3f}")
         
-        # Visualization
+        # Display frame log in expander
         frame_log = result.get("frame_log", [])
-        if len(frame_log) >= 2:
-            st.markdown("### 📈 Temporal Analysis")
-            
-            # Extract data
-            frame_indices = [f["frame_idx"] for f in frame_log]
-            raw_probs = [f.get("fake_prob_raw", f.get("fake_prob_smoothed", 0.5)) for f in frame_log]
-            smoothed_probs = [f.get("fake_prob_smoothed", f.get("fake_prob_raw", 0.5)) for f in frame_log]
-            qualities = [f.get("quality", 0.5) for f in frame_log]
-            
-            # Create matplotlib figure
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-            
-            # Top subplot - probabilities
-            ax1.plot(frame_indices, raw_probs, 'gray', linestyle='--', label='Raw', alpha=0.7)
-            ax1.plot(frame_indices, smoothed_probs, 'red', linewidth=2, label='Smoothed')
-            ax1.axhline(y=custom_threshold, color='orange', linestyle='--', label=f'Threshold ({custom_threshold})')
-            ax1.set_xlabel('Frame Number')
-            ax1.set_ylabel('Fake Probability')
-            ax1.set_title('Fake Probability Over Time')
-            ax1.legend()
-            ax1.grid(True, alpha=0.3)
-            ax1.set_ylim(0, 1)
-            
-            # Bottom subplot - quality
-            ax2.bar(frame_indices, qualities, color='lightblue', alpha=0.7, label='Frame Quality')
-            ax2.set_xlabel('Frame Number')
-            ax2.set_ylabel('Quality Score')
-            ax2.set_title('Frame Quality Over Time')
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-            ax2.set_ylim(0, 1)
-            
-            plt.tight_layout()
-            st.pyplot(fig)
-            plt.close()
+        if frame_log and analysis_mode in ["Detailed", "Debug"]:
+            with st.expander("📊 Frame Details"):
+                # Create simple table
+                frame_data = []
+                for f in frame_log[-20:]:  # Show last 20 frames
+                    frame_data.append({
+                        "Frame": f["frame_idx"],
+                        "Time (s)": f"{f['timestamp']:.1f}",
+                        "Fake Prob": f"{f['fake_prob_smoothed']:.3f}",
+                        "Faces": f.get('num_faces', 1)
+                    })
+                
+                df = pd.DataFrame(frame_data)
+                st.dataframe(df, use_container_width=True)
         
         # Download report option
         if st.button("📥 Download Analysis Report"):
