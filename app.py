@@ -1,5 +1,5 @@
 """
-app.py — Enhanced Streamlit UI with better visualization and debugging
+app.py — Complete app without matplotlib dependency
 """
 
 import os
@@ -13,20 +13,6 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 import json
-
-# Handle matplotlib import with fallback
-try:
-    import matplotlib
-    matplotlib.use('Agg')  # Use non-interactive backend
-    import matplotlib.pyplot as plt
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    st.warning("Matplotlib not available. Charts will be disabled.")
-
-# Set matplotlib backend for Streamlit
-if MATPLOTLIB_AVAILABLE:
-    plt.switch_backend('Agg')
 
 # Define cleanup function at the very beginning
 def cleanup_crops():
@@ -144,6 +130,19 @@ st.markdown("""
         padding: 1rem;
         margin: 1rem 0;
         border-radius: 5px;
+    }
+    .confidence-bar {
+        background-color: #e5e7eb;
+        border-radius: 10px;
+        height: 20px;
+        overflow: hidden;
+        margin: 10px 0;
+    }
+    .confidence-fill {
+        background: linear-gradient(90deg, #10b981 0%, #ef4444 100%);
+        height: 100%;
+        border-radius: 10px;
+        transition: width 0.3s ease;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -319,6 +318,11 @@ try:
                 with st.expander("📈 Quick Quality Check"):
                     st.write(f"**Blur Score:** {blur_score:.1f} {'(Blurry)' if blur_score < 25 else '(Sharp)'}")
                     st.write(f"**Contrast:** {contrast:.1f} {'(Low)' if contrast < 30 else '(Good)'}")
+                    
+                    # Simple quality bar
+                    quality_score = min(100, (blur_score/50)*50 + (contrast/100)*50)
+                    st.write(f"**Quality Score:** {quality_score:.0f}/100")
+                    st.progress(quality_score/100)
             except Exception as e:
                 st.warning(f"Quality check failed: {e}")
         
@@ -368,12 +372,32 @@ try:
                 st.write(f"**Raw Fake Probability:** {fake_prob:.3f}")
                 st.write(f"**Threshold:** {custom_threshold}")
                 
-                # Create simple gauge using st.progress
-                col1, col2, col3 = st.columns([1, 2, 1])
-                with col2:
-                    st.write("Fake Probability")
-                    st.progress(fake_prob)
-                    st.caption(f"{fake_prob*100:.1f}%")
+                # Create confidence bar
+                st.write("**Fake Probability**")
+                st.progress(fake_prob)
+                st.caption(f"{fake_prob*100:.1f}%")
+                
+                # Show which side of threshold
+                if fake_prob >= custom_threshold:
+                    st.error(f"⚠️ Above threshold → Fake")
+                else:
+                    st.success(f"✅ Below threshold → Real")
+            
+            # Display per-face results
+            face_results = result.get("face_results", [])
+            if face_results:
+                st.markdown("#### 👤 Per-Face Analysis")
+                
+                face_data = []
+                for i, (fr_label, fr_conf, _) in enumerate(face_results):
+                    face_data.append({
+                        "Face": f"Face {i+1}",
+                        "Result": "🚨 Fake" if "Fake" in fr_label else "✅ Real",
+                        "Confidence": f"{fr_conf:.1f}%"
+                    })
+                
+                df = pd.DataFrame(face_data)
+                st.dataframe(df, use_container_width=True)
         
         # Debug mode
         if st.session_state.debug_mode:
@@ -479,6 +503,10 @@ try:
             fake_prob = result.get("fake_prob", 0)
             st.metric("Frames Analyzed", frames_used)
             st.metric("Mean Fake Probability", f"{fake_prob:.3f}")
+            
+            # Add confidence bar
+            st.write("**Fake Probability**")
+            st.progress(fake_prob)
         
         # Display frame log in expander
         frame_log = result.get("frame_log", [])
@@ -490,12 +518,23 @@ try:
                     frame_data.append({
                         "Frame": f["frame_idx"],
                         "Time (s)": f"{f['timestamp']:.1f}",
-                        "Fake Prob": f"{f['fake_prob_smoothed']:.3f}",
+                        "Fake Prob": f"{f.get('fake_prob_smoothed', f.get('fake_prob', 0)):.3f}",
                         "Faces": f.get('num_faces', 1)
                     })
                 
                 df = pd.DataFrame(frame_data)
                 st.dataframe(df, use_container_width=True)
+        
+        # Statistics summary
+        if 'statistics' in result:
+            with st.expander("📈 Detailed Statistics"):
+                stats = result['statistics']
+                st.write(f"**Mean Probability:** {stats.get('mean', 0):.3f}")
+                st.write(f"**Median Probability:** {stats.get('median', 0):.3f}")
+                st.write(f"**Standard Deviation:** {stats.get('std', 0):.3f}")
+                st.write(f"**Frames Analyzed:** {stats.get('frames_analyzed', 0)}")
+                if 'threshold_used' in result:
+                    st.write(f"**Threshold Used:** {result['threshold_used']:.3f}")
         
         # Download report option
         if st.button("📥 Download Analysis Report"):
@@ -506,7 +545,8 @@ try:
                 "confidence": confidence,
                 "frames_analyzed": result.get("frames_used", 0),
                 "mean_fake_probability": result.get("fake_prob", 0),
-                "frame_log": frame_log
+                "frame_log": frame_log,
+                "statistics": result.get("statistics", {})
             }
             
             report_json = json.dumps(report_data, indent=2)
