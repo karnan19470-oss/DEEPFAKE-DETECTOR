@@ -1,211 +1,245 @@
 """
-video_predictor.py — Video deepfake predictor.
-
-Samples frames at ~1 fps, runs face detection + TTA inference on each,
-then aggregates using a weighted mean + median combination that is robust
-to occasional bad frames (motion blur, partial faces, occlusion).
-
-Usage (CLI):
-    python video_predictor.py <video_path>
-
-Depends on:
-    predictor.py    — predict_with_tta, IMG_SIZE, FAKE_THRESHOLD, REAL_THRESHOLD
-    face_cropper.py — detect_faces_dnn
-    utils.py        — enhance_image, gentle_sharpen, laplacian_variance
+predict_video.py — Fixed video prediction for better real video accuracy
 """
 
 import os
-import sys
-import cv2
+import shutil
 import numpy as np
-from typing import List, Dict, Tuple, Optional, Callable
+import cv2
+from typing import Callable, List, Optional, Dict
+import warnings
+warnings.filterwarnings('ignore')
 
-from face_cropper import detect_faces_dnn
-from utils import enhance_image, gentle_sharpen, laplacian_variance
-from predict_face import predict_with_tta, IMG_SIZE, FAKE_THRESHOLD, REAL_THRESHOLD
+from face_cropper import detect_faces_combined
+from utils import enhance_image, gentle_sharpen, laplacian_variance, reduce_compression_artifacts
 
-# ==========================
-# CONFIGURATION
-# ==========================
-
-MAX_SAMPLE_FRAMES      = 60     # hard cap on frames analysed
-MIN_FRAMES_FOR_VERDICT = 3      # below this → Uncertain (not enough signal)
-MIN_FACE_PX            = 40     # skip detections smaller than this
-BLUR_THRESHOLD         = 30     # skip blurry frames
-MIN_FRAME_CONFIDENCE   = 0.45   # skip near-random model outputs (p < 0.45)
-SAMPLE_EVERY_N_SECONDS = 1.0    # target sampling rate
-
-# Video-specific class names (distinct from image-level CLASS_NAMES)
-VIDEO_CLASS_NAMES = ["Real Video", "Fake Video"]
-
+# Import from predict_face
+from predict_face import (
+    predict_with_calibration,
+    assess_quality,
+    IMG_SIZE,
+    FAKE_THRESHOLD,
+    inference_transform
+)
 
 # ==========================
-# HELPERS
+# CONFIGURATION - ADJUSTED FOR BETTER REAL VIDEO ACCURACY
 # ==========================
 
-def _clamp(val: int, lo: int, hi: int) -> int:
-    return max(lo, min(val, hi))
+SAMPLE_EVERY_N_SECONDS = 0.5
+MAX_FRAMES = 300
+MIN_FRAMES_FOR_VERDICT = 3
+MIN_FACE_PX = 50
+BLUR_THRESHOLD = 18  # Lowered to accept slightly blurry real videos
+MIN_FRAME_CONFIDENCE = 0.40  # Lowered threshold
+OUTLIER_STD_MULT = 2.0
+TEMPORAL_SMOOTHING_WINDOW = 7  # Increased for smoother transitions
 
+# NEW: Bias correction for real videos
+REAL_VIDEO_BIAS = -0.08  # Slight bias toward real (negative = more likely real)
+CONFIDENCE_THRESHOLD_HIGH = 0.75  # High confidence threshold
+CONFIDENCE_THRESHOLD_LOW = 0.45   # Low confidence threshold
 
-def _crop_face_from_box(
-    rgb_frame: np.ndarray,
-    box: list,
-    margin: float = 0.20,
-) -> np.ndarray:
-    """
-    Crop a detected face with proportional context margins.
-
-    Args:
-        rgb_frame : full-resolution RGB uint8 frame.
-        box       : [x, y, w, h] from detect_faces_dnn.
-        margin    : fraction of face size to add on each side.
-    Returns:
-        RGB uint8 crop, or empty array if coordinates are degenerate.
-    """
-    h_img, w_img = rgb_frame.shape[:2]
-    x, y, w, h   = box
-    mx = int(w * margin)
-    my = int(h * margin)
-    x1 = _clamp(x - mx,         0, w_img)
-    x2 = _clamp(x + w + mx,     0, w_img)
-    y1 = _clamp(y - my,          0, h_img)
-    y2 = _clamp(y + h + my,      0, h_img)
-    return rgb_frame[y1:y2, x1:x2]
-
-
-def _sample_frame_indices(total_frames: int, fps: float) -> List[int]:
-    """
-    Build a list of frame indices to sample.
-
-    Samples ~1 frame/second throughout the video.
-    Always includes first and last frames for context.
-    Caps at MAX_SAMPLE_FRAMES, distributed evenly.
-    """
-    if total_frames <= 0:
-        return []
-
-    step    = max(1, int(round(fps * SAMPLE_EVERY_N_SECONDS)))
-    indices = list(range(0, total_frames, step))
-
-    # Sub-sample evenly if too many
-    if len(indices) > MAX_SAMPLE_FRAMES:
-        chosen  = np.linspace(0, len(indices) - 1, MAX_SAMPLE_FRAMES, dtype=int)
-        indices = [indices[i] for i in chosen]
-
-    # Always include first and last
-    for special in (0, total_frames - 1):
-        if special not in indices:
-            indices.append(special)
-
-    return sorted(set(indices))
-
-
-def _result_to_fake_prob(label: str, confidence: float) -> float:
-    """
-    Convert a predict_image() result to a fake probability in [0, 1].
-
-    This is the function that fixes the original app.py video bug where:
-      - Fake  → conf used directly as a percentage → correct scale but
-      - Real  → 100 - conf appended → this IS correct (converts real-
-                confidence to a fake score on the same 0-100 scale)
-
-    However, accumulating as 0-100 and comparing to 50 is numerically
-    identical to 0-1 compared to 0.5, so the original logic was actually
-    fine for the accumulation step.
-
-    The real bug was that app.py mixed 'conf' (0-100) and 'fake_score'
-    (also 0-100) without distinguishing them — here we use a single
-    consistent [0, 1] fake probability throughout.
-
-      "Fake"      → confidence / 100       e.g. 82% fake  → 0.82
-      "Real"      → 1 - confidence / 100   e.g. 90% real  → 0.10
-      "Uncertain" → 0.5                    neutral, no signal
-    """
-    if "Fake" in label:
-        return confidence / 100.0
-    elif "Real" in label:
-        return 1.0 - (confidence / 100.0)
-    else:
-        return 0.5
-
-
-def _build_verdict(mean_fake_prob: float, n_frames: int) -> Dict:
-    """Convert a mean fake probability → verdict dict."""
-    if mean_fake_prob >= FAKE_THRESHOLD:
-        label = VIDEO_CLASS_NAMES[1]            # "Fake Video"
-        conf  = round(min(mean_fake_prob * 100, 100.0), 2)
-    elif mean_fake_prob <= REAL_THRESHOLD:
-        label = VIDEO_CLASS_NAMES[0]            # "Real Video"
-        conf  = round(min((1.0 - mean_fake_prob) * 100, 100.0), 2)
-    else:
-        label = "Uncertain"
-        conf  = round(abs(mean_fake_prob - 0.5) * 200, 2)
-
-    return {
-        "label":        label,
-        "confidence":   conf,
-        "fake_prob":    round(mean_fake_prob, 4),
-        "frames_used":  n_frames,
-    }
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================
-# PER-FRAME INFERENCE
+# TEMPORAL ANALYSIS
 # ==========================
 
-def _analyse_frame(rgb_frame: np.ndarray) -> Optional[float]:
-    """
-    Run face detection + TTA inference on a single RGB frame.
+class TemporalAnalyzer:
+    """Analyze temporal consistency of predictions"""
+    
+    def __init__(self, window_size: int = TEMPORAL_SMOOTHING_WINDOW):
+        self.window_size = window_size
+        self.history = []
+    
+    def add_prediction(self, fake_prob: float, confidence: float, frame_quality: float):
+        """Add new prediction to history with confidence and quality"""
+        self.history.append({
+            'fake_prob': fake_prob,
+            'confidence': confidence,
+            'quality': frame_quality,
+            'timestamp': len(self.history)
+        })
+        if len(self.history) > self.window_size:
+            self.history.pop(0)
+    
+    def get_smoothed(self) -> Dict:
+        """Get temporally smoothed prediction with confidence"""
+        if not self.history:
+            return {'fake_prob': 0.5, 'confidence': 0.0, 'consistency': 0.0}
+        
+        # Weighted average (more weight to recent frames and high quality frames)
+        weights = []
+        for i, h in enumerate(self.history):
+            # Recent frames get more weight
+            recency_weight = np.exp(i / len(self.history))
+            # High quality frames get more weight
+            quality_weight = h['quality'] + 0.5
+            weights.append(recency_weight * quality_weight)
+        
+        weights = np.array(weights)
+        weights = weights / weights.sum()
+        
+        weighted_fake = sum(h['fake_prob'] * w for h, w in zip(self.history, weights))
+        
+        # Calculate temporal consistency
+        fake_probs = [h['fake_prob'] for h in self.history]
+        temporal_std = np.std(fake_probs) if len(fake_probs) > 1 else 0
+        
+        # Higher confidence if predictions are consistent
+        consistency_score = 1 - min(temporal_std, 0.5)
+        avg_confidence = np.mean([h['confidence'] for h in self.history])
+        
+        combined_confidence = avg_confidence * (0.7 + 0.3 * consistency_score)
+        
+        return {
+            'fake_prob': weighted_fake,
+            'confidence': combined_confidence,
+            'consistency': consistency_score,
+            'temporal_std': temporal_std,
+            'trend': self._get_trend()
+        }
+    
+    def _get_trend(self) -> str:
+        """Determine trend of predictions"""
+        if len(self.history) < 5:
+            return 'stable'
+        
+        recent = [h['fake_prob'] for h in self.history[-3:]]
+        older = [h['fake_prob'] for h in self.history[:3]]
+        
+        recent_avg = np.mean(recent)
+        older_avg = np.mean(older)
+        
+        if recent_avg > older_avg + 0.1:
+            return 'increasing_fake'
+        elif recent_avg < older_avg - 0.1:
+            return 'decreasing_fake'
+        else:
+            return 'stable'
+    
+    def is_consistent(self) -> bool:
+        """Check if predictions are consistent"""
+        if len(self.history) < 3:
+            return True
+        fake_probs = [h['fake_prob'] for h in self.history]
+        return np.std(fake_probs) < 0.2  # Increased tolerance
 
-    Returns the fake probability (0-1) of the most confident face,
-    or None if the frame has no usable face.
+# ==========================
+# ENHANCED FRAME ANALYSIS
+# ==========================
 
-    Using the most confident face (rather than averaging all faces)
-    is safer for video — a single clearly fake face in a crowd is
-    the important signal, not an average diluted by real bystanders.
+def analyze_frame_enhanced(rgb_frame: np.ndarray, use_tta: bool = True) -> Optional[Dict]:
     """
-    detections = detect_faces_dnn(rgb_frame)
+    Enhanced frame analysis with quality-aware prediction
+    """
+    # Detect faces
+    detections = detect_faces_combined(rgb_frame)
+    
     if not detections:
         return None
-
-    best_fake_p: Optional[float] = None
-    best_conf   = -1.0
-
-    for det in detections:
-        face = _crop_face_from_box(rgb_frame, det["box"])
-        if face.size == 0:
+    
+    # Collect all faces for voting
+    face_predictions = []
+    h_img, w_img = rgb_frame.shape[:2]
+    
+    for detection in detections:
+        x, y, w, h = detection["box"]
+        conf = detection["confidence"]
+        
+        # Skip very small faces
+        if w < MIN_FACE_PX or h < MIN_FACE_PX:
             continue
-        if face.shape[0] < MIN_FACE_PX or face.shape[1] < MIN_FACE_PX:
+        
+        # Extract face region with padding
+        pad_x = int(w * 0.2)
+        pad_y = int(h * 0.2)
+        
+        x1 = max(0, x - pad_x)
+        x2 = min(w_img, x + w + pad_x)
+        y1 = max(0, y - pad_y)
+        y2 = min(h_img, y + h + pad_y)
+        
+        face_region = rgb_frame[y1:y2, x1:x2]
+        
+        if face_region.size == 0:
             continue
-
-        # Enhance / sharpen on full-res crop BEFORE resize
-        if np.std(face) < 50:
-            face = enhance_image(face)
-        else:
-            face = gentle_sharpen(face)
-
-        face_resized = cv2.resize(face, (IMG_SIZE, IMG_SIZE))
-
-        if laplacian_variance(face_resized) < BLUR_THRESHOLD:
+        
+        # Quality assessment
+        blur_score = laplacian_variance(face_region)
+        contrast = np.std(face_region)
+        
+        # Skip very blurry or low contrast faces
+        if blur_score < BLUR_THRESHOLD or contrast < 10:
             continue
-
-        prob   = predict_with_tta(face_resized)
-        real_p = prob[0].item()
-        fake_p = prob[1].item()
-
-        if max(real_p, fake_p) < MIN_FRAME_CONFIDENCE:
+        
+        # Apply minimal enhancement for real videos (avoid over-processing)
+        try:
+            if contrast < 30:
+                face_region = enhance_image(face_region, method='clahe')
+            elif blur_score < 30:
+                face_region = gentle_sharpen(face_region, strength=0.2)
+        except:
+            pass
+        
+        # Resize for model
+        face_resized = cv2.resize(face_region, (IMG_SIZE, IMG_SIZE))
+        
+        # Run prediction
+        try:
+            real_p, fake_p = predict_with_calibration(face_resized, use_tta=use_tta)
+            
+            # Apply real video bias (makes it more likely to be real)
+            fake_p = max(0, min(1, fake_p + REAL_VIDEO_BIAS))
+            
+            # Calculate quality score
+            quality_score = min(blur_score / 40.0, 1.0) * min(contrast / 50.0, 1.0)
+            
+            # Area weight (larger faces more important)
+            area = w * h
+            area_weight = area / (max(d["box"][2] * d["box"][3] for d in detections) if detections else 1)
+            
+            # Combined weight
+            weight = conf * (0.5 + 0.5 * area_weight) * quality_score
+            
+            face_predictions.append({
+                'fake_prob': fake_p,
+                'weight': weight,
+                'quality': quality_score,
+                'area': area
+            })
+        except Exception as e:
             continue
-
-        # Keep the face with the highest detector confidence
-        if det["confidence"] > best_conf:
-            best_conf   = det["confidence"]
-            best_fake_p = fake_p
-
-    return best_fake_p
-
+    
+    if not face_predictions:
+        return None
+    
+    # Weighted voting
+    total_weight = sum(p['weight'] for p in face_predictions)
+    if total_weight > 0:
+        weighted_fake = sum(p['fake_prob'] * p['weight'] for p in face_predictions) / total_weight
+    else:
+        weighted_fake = 0.5
+    
+    # Calculate confidence from face agreement
+    fake_probs = [p['fake_prob'] for p in face_predictions]
+    agreement = 1 - np.std(fake_probs) if len(fake_probs) > 1 else 1
+    
+    # Calculate frame quality
+    avg_quality = np.mean([p['quality'] for p in face_predictions])
+    
+    return {
+        "fake_prob": weighted_fake,
+        "confidence": agreement * avg_quality,
+        "num_faces": len(face_predictions),
+        "agreement": agreement,
+        "frame_quality": avg_quality,
+        "face_std": np.std(fake_probs) if len(fake_probs) > 1 else 0
+    }
 
 # ==========================
-# MAIN FUNCTION
+# MAIN VIDEO PREDICTION
 # ==========================
 
 def predict_video(
@@ -213,137 +247,210 @@ def predict_video(
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> Dict:
     """
-    Analyse a video file for deepfake content.
-
-    Args:
-        video_path        : path to the video file.
-        progress_callback : optional callable(fraction, status_string).
-                            fraction is in [0, 1].
-
-    Returns dict:
-        label        — verdict string (VIDEO_CLASS_NAMES entry or "Uncertain")
-        confidence   — float 0-100
-        fake_prob    — raw combined fake probability (0-1)
-        frames_used  — number of frames that contributed
-        frame_log    — list of per-frame dicts for charting:
-                         { frame_idx, fake_prob }
-        error        — None on success, error string on failure
+    Enhanced video prediction with bias correction for real videos
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {
-            "label": "Invalid Video", "confidence": 0.0,
-            "fake_prob": 0.5, "frames_used": 0,
-            "frame_log": [], "error": f"Cannot open: {video_path}",
+            "label": "Error",
+            "confidence": 0.0,
+            "frames_used": 0,
+            "fake_prob": 0.0,
+            "frame_log": [],
+            "error": "Cannot open video file"
         }
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    sample_indices = _sample_frame_indices(total_frames, fps)
-    n_to_sample    = len(sample_indices)
-
-    print(f"\n[video_predictor] {os.path.basename(video_path)}")
-    print(f"  total_frames={total_frames}  fps={fps:.1f}  "
-          f"sampling {n_to_sample} frame(s)")
-
-    fake_probs: List[float] = []
-    frame_log:  List[Dict]  = []
-
-    for sample_num, frame_idx in enumerate(sample_indices):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    
+    # Get video info
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    duration = total_frames / fps if fps > 0 else 0
+    
+    print(f"\n{'='*60}")
+    print(f"🎬 VIDEO ANALYSIS: {os.path.basename(video_path)}")
+    print(f"{'='*60}")
+    print(f"  FPS: {fps:.1f}, Duration: {duration:.1f}s")
+    print(f"  FAKE_THRESHOLD: {FAKE_THRESHOLD}")
+    print(f"  REAL_VIDEO_BIAS: {REAL_VIDEO_BIAS}")
+    
+    # Calculate sampling interval
+    frame_interval = max(1, int(round(fps * SAMPLE_EVERY_N_SECONDS)))
+    max_samples = min(MAX_FRAMES, total_frames // frame_interval)
+    
+    frame_id = 0
+    sampled = 0
+    frame_results = []
+    temporal_analyzer = TemporalAnalyzer()
+    
+    while cap.isOpened() and sampled < max_samples:
         ret, frame = cap.read()
-        if not ret or frame is None:
-            print(f"  [skip] frame {frame_idx} — could not read")
+        if not ret:
+            break
+        
+        frame_id += 1
+        
+        # Sample at intervals
+        if frame_id % frame_interval != 0:
             continue
-
-        rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        fake_p   = _analyse_frame(rgb)
-
-        if fake_p is not None:
-            fake_probs.append(fake_p)
-            frame_log.append({"frame_idx": frame_idx, "fake_prob": round(fake_p, 4)})
-            print(f"  frame {frame_idx:5d}  fake_p={fake_p:.3f}")
-        else:
-            print(f"  frame {frame_idx:5d}  — no usable face")
-
-        if progress_callback is not None:
-            fraction = (sample_num + 1) / max(n_to_sample, 1)
-            progress_callback(
-                min(fraction, 1.0),
-                f"Analysed {len(fake_probs)} frame(s) with faces…"
-            )
-
+        
+        sampled += 1
+        
+        # Update progress
+        if progress_callback:
+            progress = min(frame_id / total_frames, 0.99)
+            progress_callback(progress, f"Frame {frame_id}/{total_frames}")
+        
+        # Convert to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Analyze frame
+        result = analyze_frame_enhanced(rgb_frame, use_tta=True)
+        
+        if result:
+            fake_prob = result["fake_prob"]
+            frame_confidence = result["confidence"]
+            frame_quality = result["frame_quality"]
+            
+            # Add to temporal analyzer
+            temporal_analyzer.add_prediction(fake_prob, frame_confidence, frame_quality)
+            smoothed = temporal_analyzer.get_smoothed()
+            
+            frame_results.append({
+                "frame_idx": frame_id,
+                "timestamp": frame_id / fps,
+                "fake_prob_raw": fake_prob,
+                "fake_prob_smoothed": smoothed['fake_prob'],
+                "confidence": frame_confidence,
+                "num_faces": result['num_faces'],
+                "agreement": result['agreement'],
+                "quality": frame_quality
+            })
+            
+            # Determine per-frame verdict
+            frame_verdict = "FAKE" if fake_prob >= FAKE_THRESHOLD else "REAL"
+            frame_conf = abs(fake_prob - 0.5) * 200
+            
+            print(f"  Frame {frame_id:5d}: {frame_verdict} ({frame_conf:.1f}%) | "
+                  f"fake={fake_prob:.3f} | faces={result['num_faces']} | "
+                  f"agree={result['agreement']:.2f}")
+    
     cap.release()
-
-    if len(fake_probs) < MIN_FRAMES_FOR_VERDICT:
+    
+    # Clean up crops
+    crops_dir = os.path.join(BASE_DIR, "cropped_faces")
+    if os.path.exists(crops_dir):
+        shutil.rmtree(crops_dir)
+    os.makedirs(crops_dir, exist_ok=True)
+    
+    # Check if we have enough frames
+    if len(frame_results) < MIN_FRAMES_FOR_VERDICT:
         return {
-            "label": "Uncertain", "confidence": 0.0,
-            "fake_prob": 0.5, "frames_used": len(fake_probs),
-            "frame_log": frame_log,
-            "error": (
-                f"Only {len(fake_probs)} usable frame(s) found "
-                f"(need ≥ {MIN_FRAMES_FOR_VERDICT})."
-            ),
+            "label": "Insufficient Data",
+            "confidence": 0.0,
+            "frames_used": len(frame_results),
+            "fake_prob": 0.0,
+            "frame_log": [],
+            "error": f"Only {len(frame_results)} usable frames"
         }
-
-    arr       = np.array(fake_probs)
-
-    # Rolling smoothing — reduces impact of single wildly-wrong frames.
-    # mode="same" keeps array length constant (unlike "valid" which shrinks it).
-    window   = min(5, len(arr))
-    kernel   = np.ones(window) / window
-    smoothed = np.convolve(arr, kernel, mode="same")
-
-    mean_p   = float(np.mean(smoothed))
-    median_p = float(np.median(smoothed))
-
-    # 70% mean + 30% median: mean captures overall signal,
-    # median resists outlier frames that are strongly mispredicted.
-    combined = 0.70 * mean_p + 0.30 * median_p
-
-    print(f"\n[video_predictor] mean={mean_p:.3f}  median={median_p:.3f}  "
-          f"combined={combined:.3f}  frames_used={len(fake_probs)}")
-
-    verdict = _build_verdict(combined, len(fake_probs))
-    verdict["frame_log"] = frame_log
-    verdict["error"]     = None
-    return verdict
-
-
-# ==========================
-# TIMELINE UTILITY
-# ==========================
-
-def fake_probability_timeline(
-    frame_log: List[Dict],
-) -> Tuple[List[int], List[float]]:
-    """
-    Extract parallel (frame_indices, fake_probs) from a frame_log.
-    Useful for plotting a timeline chart in the UI.
-    """
-    indices = [e["frame_idx"]  for e in frame_log]
-    probs   = [e["fake_prob"]  for e in frame_log]
-    return indices, probs
-
-
-# ==========================
-# CLI ENTRY POINT
-# ==========================
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python video_predictor.py <video_path>")
-        sys.exit(1)
-
-    result = predict_video(sys.argv[1])
-
-    print(f"\n{'='*45}")
-    print("  FINAL VIDEO VERDICT")
-    print(f"{'='*45}")
-    print(f"  Prediction  : {result['label']}")
-    print(f"  Confidence  : {result['confidence']:.2f}%")
-    print(f"  Frames used : {result['frames_used']}")
-    print(f"  Mean fake p : {result['fake_prob']:.4f}")
-    if result.get("error"):
-        print(f"  Note        : {result['error']}")
-    print(f"{'='*45}\n")
+    
+    # Extract smoothed probabilities
+    smoothed_probs = [r["fake_prob_smoothed"] for r in frame_results]
+    
+    # Remove outliers
+    if len(smoothed_probs) >= 6:
+        arr = np.array(smoothed_probs)
+        mean = arr.mean()
+        std = arr.std()
+        if std > 0.05:
+            filtered = [p for p in smoothed_probs if abs(p - mean) <= OUTLIER_STD_MULT * std]
+            if len(filtered) >= MIN_FRAMES_FOR_VERDICT:
+                smoothed_probs = filtered
+                print(f"\n  Removed {len(frame_results) - len(smoothed_probs)} outlier frames")
+    
+    # Calculate statistics
+    probs_array = np.array(smoothed_probs)
+    mean_prob = float(probs_array.mean())
+    median_prob = float(np.median(probs_array))
+    std_prob = float(probs_array.std())
+    
+    # Get temporal statistics
+    temporal_stats = temporal_analyzer.get_smoothed()
+    is_consistent = temporal_analyzer.is_consistent()
+    trend = temporal_stats['trend']
+    
+    # Smart combination based on consistency and trend
+    if is_consistent:
+        if trend == 'decreasing_fake':
+            # If fake probability is decreasing, bias toward real
+            combined_prob = mean_prob * 0.7 + median_prob * 0.3
+            combined_prob = combined_prob * 0.9  # Reduce fake probability
+        elif trend == 'increasing_fake':
+            combined_prob = mean_prob * 0.6 + median_prob * 0.4
+        else:
+            combined_prob = mean_prob * 0.6 + median_prob * 0.4
+    else:
+        # Inconsistent - trust median more
+        combined_prob = mean_prob * 0.4 + median_prob * 0.6
+    
+    # Apply variance penalty
+    variance_penalty = min(std_prob * 0.5, 0.15)
+    combined_prob = combined_prob * (1 - variance_penalty)
+    
+    # Final bias for real videos
+    if combined_prob < 0.6:  # If not strongly fake
+        combined_prob = combined_prob * 0.95  # Slight bias toward real
+    
+    print(f"\n{'='*60}")
+    print(f"📊 VIDEO ANALYSIS SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Frames analyzed: {len(smoothed_probs)}")
+    print(f"  Mean probability: {mean_prob:.3f}")
+    print(f"  Median probability: {median_prob:.3f}")
+    print(f"  Std deviation: {std_prob:.3f}")
+    print(f"  Temporal consistency: {temporal_stats['consistency']:.3f}")
+    print(f"  Trend: {trend}")
+    print(f"  Combined probability: {combined_prob:.3f}")
+    print(f"  Threshold: {FAKE_THRESHOLD}")
+    
+    # Determine verdict with confidence
+    if combined_prob >= FAKE_THRESHOLD:
+        # Fake video
+        label = "Fake Video"
+        confidence = min(combined_prob * 100, 99.9)
+        
+        # Adjust confidence based on consistency
+        if not is_consistent:
+            confidence = confidence * 0.85
+        if trend == 'decreasing_fake':
+            confidence = confidence * 0.9
+        
+        print(f"\n🚨 VERDICT: {label} with {confidence:.1f}% confidence")
+    else:
+        # Real video - boost confidence
+        label = "Real Video"
+        real_prob = 1 - combined_prob
+        confidence = min(real_prob * 100, 99.9)
+        
+        # Boost confidence for consistent real predictions
+        if is_consistent and combined_prob < 0.45:
+            confidence = min(confidence * 1.15, 99.9)
+        if trend == 'decreasing_fake':
+            confidence = min(confidence * 1.1, 99.9)
+        
+        print(f"\n✅ VERDICT: {label} with {confidence:.1f}% confidence")
+    
+    return {
+        "label": label,
+        "confidence": round(confidence, 2),
+        "frames_used": len(smoothed_probs),
+        "fake_prob": round(combined_prob, 4),
+        "frame_log": frame_results,
+        "error": None,
+        "statistics": {
+            "mean": mean_prob,
+            "median": median_prob,
+            "std": std_prob,
+            "temporal_consistency": temporal_stats['consistency'],
+            "trend": trend,
+            "frames_analyzed": len(frame_results)
+        }
+    }
